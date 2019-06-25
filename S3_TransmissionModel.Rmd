@@ -1,0 +1,164 @@
+
+This script contains a network based SEIR transmission model that uses heterogeneous contact information via adjacency matrices. The model assumes contacts have been aggregated over an hour or a day. It is parameterized for a generic pathogen and includes parameters (in hours) for latent period and recovery period, and median infective doses of 10000 CFU, and CFU per contact duration of 100. 
+
+The model has been set up to use an hourly adjacency matrix array produced by the script found in supplementary electronic materials S1. The contact array consists of 24 hours of contact data. To make a longer run, you simply replicate the the array, included as an option.  
+
+This first code chunk loads the funtion.  
+```{r}
+NetworkSpread<-function(data1,Ind=70, Timeag="Hour", EC50=10000, slope=1, LatentPeriod=24, RecoveryPeriod=240, CFUpdur=100) {
+
+	cowstart<-c(1:Ind)
+	Vinitial= sample(cowstart,1)
+	CFUpduration=CFUpdur
+	Epistatmat<-data.frame(matrix(0, nrow=Ind, 8,dimnames=list(c(), c("Infected", "Exposed", "Shedding", "Recovered", "WhoInfectedMe", "TimeInfected", "NumInfected","TimeRecovered"))),stringsAsFactors=F) #tsf; added the WhoInfectedMe field
+	Epistatmat$Infected[Vinitial]=1
+	Epistatmat$Exposed[Vinitial]=LatentPeriod   
+	
+	Tracking<-data.frame(matrix(0, nrow=1, 3,dimnames=list(c(), c("Infected", "Shedding", "Recovered"))),stringsAsFactors=F) #This data frame will be used to track the number of infected and recovered individuals at each time step 
+	InfectTrack<-NULL #this will be rbound to Tracking at each time step
+	
+	#Start the simulation 
+	currinfectlist<-list()
+	newinfectlist<-list() 
+	recoveredlist<-list()
+	
+	for (i in 1:dim(data1)[3]){  
+			#Epidemiological book-keeping  
+			infected<-which(Epistatmat$Infected==1) # grabs the infected set for the step 
+			currentinfections=infected
+			
+			Tracking$Infected<-sum(Epistatmat$Infected) 
+			Tracking$Shedding<-ifelse(i == 1, 1, sum(Epistatmat$Shedding)) 
+			Tracking$Recovered<-sum(Epistatmat$Recovered) 
+			InfectTrack<-rbind(InfectTrack,Tracking)
+			
+				
+		#Updates status of infected individuals 
+			for (k in 1:length(infected)) { 
+				Epistatmat$Exposed[infected[k]]=Epistatmat$Exposed[infected[k]]+1 #this advances the exposure set by one, setting up a time scheme     before shedding
+				Epistatmat$Shedding[infected[k]]=ifelse(Epistatmat$Exposed[infected[k]]>=LatentPeriod, 1,0) #sets shedding status of infected individuals
+			}
+			
+			active<-which(Epistatmat$Shedding==1)
+			recovered=which(Epistatmat$Exposed >= RecoveryPeriod)
+			recoveredlist<-c(recoveredlist,list(as.numeric(recovered)))
+			
+			for (l in 1:length(recovered)){ #tsf
+				Epistatmat$Recovered[recovered[l]]=1
+				Epistatmat$Infected[recovered[l]]=0
+				Epistatmat$Shedding[recovered[l]]=0
+				Epistatmat$TimeRecovered[recovered[l]] = Epistatmat$TimeInfected[recovered[l]] + RecoveryPeriod 
+				
+			}
+			newinfections<-NULL #sets up spot for new infections to go
+			
+			infectedlist<-lapply(active,function(x) which(data1[x,,i]>0)) #this makes a list of all of the individuals              currently in contact with shedding individuals   
+			
+			
+			CFUtable=data.frame("Connections"=sort(unique(unlist(infectedlist))))
+			if (dim(CFUtable)[1]>1){
+				#    for(v in 1:length(active)){ #this goes through each active vertex 
+				for(v in 1:length(active)){ #this goes through each active vertex #DED; have to reference specific cow here
+					if (length(infectedlist)==1) {tscontacts=infectedlist
+					}else{tscontacts <- infectedlist[v] } 
+					
+					###Accumulation step 
+					accumlist=NULL   #This step goes allows cattle to accumulate CFU's based on contact wiht infectious individuals
+					for(v1 in unlist(tscontacts)){ 
+						accumlist1=data1[active[v],v1,i] * CFUpduration
+						accumlist=c(accumlist,accumlist1)}
+					
+					cfpdcowid=data.frame("Connections"=unlist(tscontacts), "cfupd"=accumlist)
+					if(dim(cfpdcowid)[1]==0){next
+						} else {
+					CFUtable=merge(CFUtable, cfpdcowid, by="Connections", all=TRUE)
+					names(CFUtable)[dim(CFUtable)[2]]=paste("cfus_",active[v], sep="")
+						}
+				}
+				
+				###Transmission step  #This step goes through the susceptible individuals and conducts transmission trials based on accumulated CFU's.  
+				CFUtable[is.na(CFUtable)]<-0
+				CFUtable$CFUtot=rowSums(CFUtable)-CFUtable$Connections 
+				for(h in 1:length(CFUtable$Connections)){ 
+						if(Epistatmat$Infected[CFUtable$Connections[h]] == 0 & Epistatmat$Recovered[CFUtable$Connections[h]] == 0){ #only uninfected individuals can be infected
+						
+								
+						infectstat <- sample(c("1","0"), 1 , prob=c((1/(1+EC50 /(CFUtable$CFUtot[h]))^slope), 
+																												(1-(1/(1+EC50 /(CFUtable$CFUtot[h]))^slope))))
+						if (infectstat == 1) {
+							Epistatmat$Infected[CFUtable$Connections[h]] = 1
+							Infector=which(CFUtable[h,2:c(dim(CFUtable)[2]-1)] %in% max(CFUtable[h,2:c(dim(CFUtable)[2]-1)]))
+							Epistatmat$WhoInfectedMe[CFUtable$Connections[h]]=ifelse(length(Infector)>1, active[sample(Infector,1)], active[Infector]) #This assigns the likely infector based on a majority rule
+							Epistatmat$TimeInfected[CFUtable$Connections[h]] = i 
+							Epistatmat$NumInfected[CFUtable$Connections[h]] = sum(Epistatmat$Infected == 1) 
+							newinfections <- c(newinfections,CFUtable$Connections[h])  #this builds of list of infected individuals
+							
+						}
+					}
+				}
+			}
+			currentinfections<-c(currentinfections,newinfections) 
+			
+			#These keep track of new and total infections at each time step
+			currinfectlist<-c(currinfectlist,list(currentinfections))
+			newinfectlist<-c(newinfectlist, list(newinfections))
+			
+		}
+		
+		Transmet<-data.frame(matrix(0, nrow=1, 7,dimnames=list(c(), c("OriginCow", "Total_Infected", "R0", "Total_Recovered", "Peak_Infection_Time", "NumPeaks","Complete_Recovery_Time"))),stringsAsFactors=F)
+		Transmet$OriginCow<-which(Epistatmat$WhoInfectedMe == 0 & Epistatmat$Exposed >= 1) #determines which cow was first infected 
+		Transmet$Total_Infected<-sum(Epistatmat$Exposed >= 1) #
+		Transmet$Total_Recovered<-sum(Epistatmat$Recovered >= 1)
+		Transmet$Peak_Infection_Time<-Epistatmat$TimeInfected[min(which(Epistatmat$NumInfected == max(Epistatmat$NumInfected)))] #this determines the timestep when the number of infected individuals first reached its peak. If the peak is reached multiple times (i.e. if a cow recovers and another is infected again) only the first peak is recorded
+		Transmet$NumPeaks<-ifelse (max(Epistatmat$NumInfected) != 0, sum(Epistatmat$NumInfected == max(Epistatmat$NumInfected)), 1)  #tsf; shows the number of times there were peaks in infectivity
+		Transmet$R0<-sum(Epistatmat$WhoInfectedMe == which(Epistatmat$WhoInfectedMe == 0 & Epistatmat$Exposed >= 1))
+		Transmet$Complete_Recovery_Time<- ifelse (sum(Epistatmat$Infected == 1) >= 1, "NA", max(Epistatmat$TimeRecovered))
+		return(list(currinfectlist, newinfectlist, recoveredlist, Epistatmat, Transmet, InfectTrack))
+	}
+    
+    
+```
+ 
+
+
+This chunk loads the parameters and the Contact Array created by running S1, or directly using the file "S1_ContactArray_ByHour_10sec_TSW_0.5m_SpTh_1_MCD_522016", produced by S1. 
+```{r}
+TSW=10
+SpTh=0.5
+MCD=1
+Month=5
+Day=2
+Year=2016
+paramtable=c(TSW,SpTh, MCD, Month, Day, Year)
+#This loads the Contact Array
+load(paste("S1_ContactDurationArray_ByHour_", paramtable[1],"sec_TSW_", paramtable[2],"m_SpTh_", paramtable[3],"_MCD_", paramtable[4], paramtable[5], paramtable[6],".RData", sep=""))
+
+
+```
+
+
+As an option, the example array(which includes 1 day(24 hours) of contact data can be replicated and stacked upon itself to construct a longer example data.  
+```{r}
+library(abind)
+SimReps=10
+adj=cta
+for(i in 1:c(SimReps-1)){
+cta=abind(cta, adj)}
+
+```
+
+This chunk will run the model. Multiple runs are generally desired. Prior to running, specify the number and type of temporal units the data is made up of (days, hours).  
+
+Model outputs include the running list of infecteds per hour/day, the running list of new infecteds per hour/day, the running list of recovereds per hour/day, a matrix that keeps track of the maiin epidemiological information for all individuals (the Epistatmat), a summary of transmission metrics, and record of numbers of infected, shedding and recovered at each time step.
+
+```{r}
+NoSim=5 #number of simulations to run
+NoTemporalUnits=24
+TemporalUnit="Hours"
+resultslist=NULL
+for (i in 1:NoSim){
+	results=NetworkSpread(data1=cta)
+	resultslist=c(resultslist, list(results))}
+save(resultslist, file = paste("TransmissionSimulation_ExampleData_",NoSim,"_Sims_",NoTemporalUnits,"_",TemporalUnit,".RData",sep="")) 
+
+```

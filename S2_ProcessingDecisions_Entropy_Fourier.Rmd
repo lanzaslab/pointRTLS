@@ -1,0 +1,112 @@
+This script will uses a duration table created via a previous script (electronic supplementary material S2), or can be loaded directly with the file "S1_DurationTime_10sec_TSW_0.5m_SpTh_1_MCD_522016.RData", It uses the duration table to create temporary adjacency matrices at each time step, for which it creates a graph entropy value for, resulting in a time series of entropy values. Lastly, it calculates the power spectrum density for the time series of entropy values. Thus, this script produces a single value per dataset. It can be modified such that multiple datasets are analysed and percent spectral density is calculated  
+
+```{r}
+
+NoInd=70
+MCD=1
+TSW=10
+SpTh=0.5
+Day=2
+Month=5
+Year=2016
+
+library(igraph)
+library(lubridate)
+load(paste("S1_DurationTime_",TSW,"sec_TSW_",SpTh,"m_SpTh_", MCD,"_MCD_",Month, Day, Year,".RData", sep=""))
+DurationTable=duration
+
+#Shifting hours of both beginning and ending of contacts.  
+DurationTable$StartHour_shift<-floor((DurationTable$Start-1)/(3600/TSW)) 
+DurationTable$EndHour_shift<-floor((DurationTable$End-1)/(3600/TSW)) 
+Seq<-seq(1,(86400/TSW),1) 
+
+
+hvec=NULL
+  for (m in 1:length(Seq)){
+  sub<-which(DurationTable$End >=Seq[m] & DurationTable$Start <= Seq[m])     
+  adj.matrix<-matrix(0,ncol=NoInd, nrow=NoInd) #sets up blank matrix
+  for ( j in 1:length(sub)) {
+  adj.matrix[DurationTable[sub[j], match("Ind2", names(DurationTable)) ],DurationTable[sub[j], match("Ind1", names(DurationTable)) ]]= DurationTable[sub[j], match("Duration", names(DurationTable))] #lower triangle
+  adj.matrix[DurationTable[sub[j], match("Ind1", names(DurationTable)) ],DurationTable[sub[j], match("Ind2", names(DurationTable)) ]]= DurationTable[sub[j], match("Duration", names(DurationTable))] } #upper triangle } 
+
+
+  deg=colSums(adj.matrix) #computes numbers of degrees per individual 
+  aij = adj.matrix / deg[col(adj.matrix)]
+  aij[is.na(aij)==TRUE]<-0
+  deg1=ifelse(deg>0,0,1)
+  aij=aij + diag(deg1)
+  
+  #Stable distribution
+  g=graph_from_adjacency_matrix(aij, weighted=TRUE) 
+  #plot(g)
+  groups=igraph::groups(components(g))#This finds all of the groups in the graph
+  if (sum(ifelse(sapply(groups, function(x) length(unlist(x)))>2,1,0)) == 0) {hvec=c(hvec,0); next} #this asks if there are any groups larger than 2; if not, the entropy is zero  
+  numlist=which(unlist(lapply(groups, function(x) length(unlist(x))))>2)   #this finds groups length 0(i.e, with greater than zero entropy)
+  veclist=NULL
+  stableprob=matrix(0,nrow=70, ncol=70)  #this sets up a blank table in which the stable chains for each group will be inserted
+  
+  for ( i in numlist){  #This goes through each group and finds the stable distribution
+  veclist=unlist(groups[[i]])  #first, it unlists the groups
+  veclist1=veclist[1]  #it pulls out the first number in the list; the distribution should converge to a single stable state, unless there are more than 1 state, in which case the below code looks for that. 
+  
+  vectotal=NULL       #This section runs 1000 iterations of multiplying the index vector for each group against the aij to get the stable distribution
+    if(veclist1==1){vec=c(1, rep(0,69))
+    }else{ vec=c(rep(0,veclist1-1),1,rep(0,70-veclist1))}
+    for(p in 1:1000){
+      vec1=aij%*%vec
+      vectotal<-cbind(vectotal, vec1)
+      vec=vec1}
+  #The below is used in the case the case that there are two or more stable states(should only be a max of two);
+  #it pulls out the last 10 records(columns) of the stable state matrix, and finds the unique values in each row(rounded by 8)
+  #then it sums them(assuming one is a zero), and multiplies by 0.5 to come up with a vector of probabilities.   
+  #lastly, it assigns the stable probs to the approriate columns such that the entropy calc will work 
+  vectotal1=apply(vectotal,1, function(x) unique(round(x[999:1000],8))[which(unique(round(x[999:1000],8))>=0)]  ) 
+ vectotal1=(1/max(unlist(lapply(vectotal1, length))))*unlist(lapply(vectotal1, sum))
+ stableprob[,veclist]<-vectotal1}
+  #This is the entropy calculation, which is the stableprob for a given vector times the log of the aij location * the aij location to get the average for the subgraph 
+  h=stableprob*aij*log(aij)  
+  h=h[!is.na(h)] #this simply removes the na's , which result from taking the log of zero's
+  h=-sum(h)  #lastly, the terms are summed for entire graph
+  hvec<-c(hvec, h) }  
+  save(hvec, file=paste("HVEC_",SpTh ,"m_Dist_",TSW,"sec_TSW_", MCD ,"_MCD.RData", sep=""))
+
+
+```
+
+
+This section translates the entropy values per time step into a power spectral density. The outputs in HourPower and DayPower represent power spectral densities for each hour of the day and for the entire day for the example dataset. There is a provided dataset for this called: 
+"S2.2HVEC_0.5m_Dist_10sec_TSW_1_MCD.RData"
+```{r}
+library(stats)
+HourPower=NULL
+DayPower=NULL
+load(paste("HVEC_",SpTh ,"m_Dist_",TSW,"sec_TSW_", MCD ,"_MCD.RData", sep=""))
+
+
+tsphour=(86400/TSW)/24
+tspday=86400/TSW
+hourlist=seq(1,length(hvec),tsphour)
+daylist=seq(1,length(hvec),tspday)
+
+
+power_h=NULL
+power_d=NULL
+
+#sequence, do fft, subtract out the mean, sum squared modulus from 1:length(b) 
+for(j in hourlist){
+
+d=stats::spectrum(hvec[j:c(j+tsphour-1)], plot=FALSE, taper=0.1) #this employs a smoother; setting the taper to zero produces very similar results to above 
+ph=sum(d$spec)                                          #This shows that square of the absolute value is generated by multiplying the complex number by its conjugate
+ power_h<-c(power_h, ph)}                             #This doesn't really answer the question of whether the zero frequency should be used 
+
+for(j in daylist){
+d=stats::spectrum(hvec[j:c(j+tsphour-1)], plot=FALSE, taper=0.1)#this employs a smoother; setting the taper to zero produces very similar results to above 
+ph=sum(d$spec)                                          #This shows that square of the absolute value is generated by multiplying the complex number by its conjugate
+power_d<-c(power_d, ph)}                               #This doesn't really answer the question of whether the zero frequency should be used 
+                                                        #Also, detrending is done. 
+
+HourPower<-cbind(HourPower,power_h)
+DayPower<-cbind(DayPower,power_d)
+
+
+```

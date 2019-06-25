@@ -1,0 +1,309 @@
+
+---
+title: "Supplemental Materials S1: Contact Data Data Processing"
+author: "Dan Dawson, Trevor Farthing"
+date: "1/3/2018"
+---
+
+This code was orginally designed to process spatial location data collected from cattle in a feed lot from a RTLS. It takes raw xy coordinates, aggregates them into defined temporal windows, computes distances between cattle at each interval, and computes contacts given a particular threshold.
+
+This particular code processes datasets (in this case, a single example set) using a single parameterization combination(i.e., Temporal Sampling Window(TSW), Spatial Threshold(SpTh), and minimum contact duration(MCD)). However, it can be modified to examine factorial combinations of TSW, SpTh, and MCD using loops.To increase processing efficiency, this code utilizes parallel processing capabilities of R through the parallel package.  
+  
+
+Along with this R Markdown file is an example datafile containing a day of contact data: 
+"CattleData_ProcessingExample_522016.RData", which has been cleaned and preprocessed into the following format:
+
+  calftag     x     y Days Day_Second Hour Month Year
+1     101 63.38 47.43    2         15    0     5 2016
+2     101 63.48 46.59    2         23    0     5 2016
+3     101 62.90 47.07    2         27    0     5 2016
+4     101 63.27 47.26    2         35    0     5 2016
+5     101 63.04 46.62    2         39    0     5 2016
+6     101 63.53 47.24    2         43    0     5 2016
+
+
+In this file, calftag is the unique identifier per individual, x and y are locations in a meter-based grid, Days are the date( in this case the 2nd of the month), Day_Second is the consecutive second of the day (out of 86400), and Month and Year are self explanatory.    
+
+#Below are definitions for several of the parameters to set prior to analysis:
+dateseq = Specific number of days/dates of data (only 1 in example case)
+TSWseq = Temporal windows (in seconds) into which data is tranferred
+SpThseq = proximity (in meters) for direct contacts between cattle
+MCDseq =Dictates the minimum number of consecutive tempseq intervals (i.e., duration) required for a "contact" to have occured 
+
+This loads the libraries needed
+```{r Setting libraries and Defining Thresholds, echo= FALSE}
+library(abind)
+library(parallel)
+library(lubridate)
+library(knitr)
+library(dplyr)#
+library(xtable)#
+
+```
+
+
+This section determines the set of model processing decisions of interest
+```{r}
+#This specification was used to set up multiple combinations temporal windows, spatial thresholds, and minimum durations  
+##Multiple combinations
+NoInd=70 #the number of individuals 
+dateseq<-seq(1,1,1) #Example data here uses only a single day
+TSW<-10 # Temporal Windows examined  
+SpTh<-0.5 #
+MCD<-1  
+
+```
+
+ ##Processing Instructions:
+Location data is initially processed by aggregating it into a matrix of average positions of each cow into temporal windows. This is done  by the overall function called "ProcessAggregateFunc". This function uses an internal function called "Processing_and_Aggregation_Procedures", which itself loads and calls a function called "Nseconds.aggregate".It is loaded within the Processing_and_Procedures function in order for the parallel processing procedure using parApply to work in ProcessAggregateFunc. 
+
+First, the "Processing_and_Procedures" uses the brk.point dataframe set up by "ProcessAggregateFunc", looping through each cow using the breakpoints id'd in brk.point. For each cow, it first smooths the data by creating a continuous record over each second of the day,filling in holes were they exist. This is accomplshed by first extrapolating to the left(i.e. before the first record of the day) by interpolating missing values throughout the record period of the day, and then extrapolating to right(i.e. after the last record of the day).Then, the second values are averaged into defined temporal units using Nseconds.aggregate.    
+
+"Nseconds.aggregate" averages the seconds data into defined temporal windows. It does this by making 2 matrices from the tmp.coord matrix of n nrows apiece (x and y coordinates) and 86400/n columns, where is the number of seconds you want per aggregation. You can use any aggregation, but if the number doesn't devide 86400 equally, then the last column(interval) will have NA's. It then takes the average of each column (geting an average xy for each interval window) using an apply function before binding them back together. 
+
+First, this first code chunk to load the processing function
+```{r Functions to Create Temporal Aggregations, echo=FALSE}
+
+ProcessAggregateFunc <- function(data1, Secondagg=10) {
+  
+  data1<-data1[order(data1$calftag, data1$Day_Second),]
+  locmatrix=NULL 
+  len=length(data1[,1])  
+  ini=min(unique(data1[,match("calftag", names(data1))]))  
+  brk=1 # this is the code for animal 1
+  for (i in 1:len) {
+    if (data1[i,match("calftag", names(data1))]!=ini) {
+      ini<-data1[i,match("calftag", names(data1))]
+      brk<-c(brk,i)                                                      
+      
+    }
+    
+  }
+  
+  start.brk=brk[1:length(unique(data1$calftag))]      
+  end.brk=c(brk[2:length(unique(data1$calftag))]-1, length(data1[,1]))
+  brk.point<-cbind(start.brk,end.brk,seq(1, length(end.brk),1), Secondagg)
+  cl<-makeCluster(detectCores(), type="SOCK")
+  locmatrix<-parApply(cl, brk.point, 1, Processing_and_Aggregation_Procedures, data1) 
+  ##Note, distmatrix will be a matrix in which the first half is the x axis, and the second is the y axis. You split out the Y coordinate section and combine it with the X in subsequent sections. 
+  stopCluster(cl)
+  return(locmatrix)          
+  ### You use the script below to break the table down into the pieces you need.  
+}
+
+Processing_and_Aggregation_Procedures<-function(brk.point, data1){
+  
+#This function aggregates fully interpolated data(i.e., by seconds) into temporal windows. It is called later in the overall processing function, but is loaded here.   
+  Nseconds.aggregate=function(coord, Secondsagg) { 
+    m=Secondsagg
+    tmp1<-coord[,1]
+    tmp2<-coord[,2]
+    tmp1.mx<-matrix(tmp1,nrow=m) # aggregate to m seconds 
+    tmp2.mx<-matrix(tmp2,nrow=m)
+    tmp1.mmin<-apply(tmp1.mx,2,mean)
+    tmp2.mmin<-apply(tmp2.mx,2,mean)
+    tmp.mmin<-cbind(tmp1.mmin, tmp2.mmin)
+    
+  }
+  
+  
+  ###  
+  coord.tmp<-matrix(rep(0,length(unique(data1$Days))*1440*60*2),ncol=2) 
+  data.one=data1[c(brk.point[1]:brk.point[2]),]  
+  data.len=length(data.one[,1])
+  xcol<-match("x", names(data.one))
+  ycol<-match("y", names(data.one))  
+  
+  
+#Extrapolate left tail
+#This section fills in the missing time between the first recorded second and the first second of the day. It assumes that the cow starts the first second of the day at the same place it spent the first recorded second for that day. 
+  tmp=as.numeric(data.one[1,xcol:ycol]) 
+  n=data.one[1,match("Day_Second", names(data.one))] 
+  coord.tmp[1:n,1]=tmp[1]
+  coord.tmp[1:n,2]=tmp[2]
+  
+#Interpolate between points  
+#This secton interpolates missing seconds of the data to make a continous dataset. It works by setting n initially to the first value of Day_Second's column of data.one. Then using a loop, it sets the first value of n.current to the ith row(starting at 2) of "Day_Second". A temporary object "tmp" pulls the x-y coordinates from the the ith row of data.one. Then, it sets the xy coordinates of coord.tmp, starting at n + 1 position to the n.current position to values of tmp. It inches along, filling in the slots small or large until it reaches the last data point. 
+  
+  for (i in 2:data.len) { 
+    n.current=data.one[i,match("Day_Second", names(data.one))]  
+    tmp=as.numeric(data.one[i,xcol:ycol])  
+    coord.tmp[(n+1):n.current,1]=tmp[1] 
+    coord.tmp[(n+1):n.current,2]=tmp[2]
+    n=n.current 
+  }
+  
+  
+#Extrapolate Right Tail: 
+#This section fills in missing values at the end of the day using the last recorded location for the indivdidual 
+  tmp=as.numeric(data.one[length(data.one[,xcol]), xcol:ycol])
+  coord.tmp[(n+1):86400,1]=tmp[1] # 60*60*24=86400 # this 60 seconds * 60 minutes * 24 hours
+  coord.tmp[(n+1):86400,2]=tmp[2]
+  
+#Aggregate function; see above 
+
+  Nseconds.aggregate(coord.tmp, brk.point[4]) 
+}
+```
+
+
+The below code runs the processing functions described above, and several additional functions. The first takes the output produced above(which are stacked xy coorinates), and breaks it out into a set of paired xycooridnates again (distmatrix1). Then,a euclidean distance function is loaded, and applies the function using a parallel processing routine to create a distance matrix (dist.all)
+The output is a matrix called "dist.all" which contains the distances between all pairs dyads over TSW-based intervals, with each column containing the average distance between two individuals during the TSW. The matrix is indexed as follows: 1,2; 1,3; 1,4;..2,3,...69,70. There is should be (N*(N-1))/2 columns ( in this case 2415), and as many rows as the TSW divides into the total day-seconds of the day. 
+
+```{r Defining Temporal Aggregations, echo=FALSE}
+for ( j in 1:length(dateseq)) {
+  load(paste("S1_CattleData_Processing_Example",dateseq[j],".RData",sep="")) 
+  Day=unique(data1$Days)
+	Month=unique(data1$Month)
+  Year=unique(data1$Year)
+  Secondagg<-TSW
+      locmatrix_processed<-ProcessAggregateFunc(data1, Secondagg) 
+      #This script breaks the table into the x and y coordinates that we'd expect here. 
+      locmatrix1<-NULL     
+      for (i in 1:length(locmatrix_processed[1,])){
+        xvec<-locmatrix_processed[1:(length(locmatrix_processed[,1])/2),i]
+        yvec<-locmatrix_processed[((length(locmatrix_processed[,1])/2)+1):length(locmatrix_processed[,1]),i]
+        xycombined<-cbind(xvec, yvec)
+        locmatrix1<-cbind(locmatrix1, xycombined)
+      }
+      save(locmatrix1, file=paste("All_locations_",TSW,"_sec_TSW_", Month, dateseq[j], Year,".RData", sep=""))
+      ##Direct Distance Matrices
+      ##############
+      #Calculate the distance s
+      euc=function(x) {
+        x.cor=c(x[1],x[3])
+        y.cor=c(x[2],x[4])
+        euc.dis=sqrt((x.cor[1]-x.cor[2])^2+(y.cor[1]-y.cor[2])^2)
+        euc.dis
+      }
+      
+      
+####This section calculates a distance matrix between all pairs using the the euclidean distance function 
+      dist.all<-NULL
+      
+      xseq<-NULL
+      for (o in seq(1,2*70-1,2)){
+        xseq1<-rep(o, 70 - o/2)
+        xseq<-c(xseq, xseq1)}
+      
+      oseq<-NULL
+      for (o in seq(3,2*70,2)){
+        oseq1<-seq(o,2*70,2)
+        oseq<-c(oseq, oseq1)}
+      
+      cl<-makeCluster(detectCores(), type="SOCK")
+       for (i in 1:length(oseq)){
+        coord.one=cbind(locmatrix1[,xseq[i]],locmatrix1[,xseq[i]+1]) 
+        coord.two=cbind(locmatrix1[,oseq[i]], locmatrix1[,oseq[i]+1])
+        coord.both=cbind(coord.one, coord.two)
+        #  dist<-apply(coord.both,1,euc) #This applies euc to each row 
+        dist<-parApply(cl, coord.both,1,euc) #This applies euc to each row 
+        dist.all<-cbind(dist.all,dist)} 
+      #head(dist.all)
+      stopCluster(cl)
+      
+      
+save(dist.all, file=paste("All_Distances_",TSW,"sec_TSW_", unique(data1$Month), dateseq[j], unique(data1$Year), ".RData", sep="")) 
+      
+    }
+  
+```
+
+
+In this next section, the dist.all matrix is used to evaluate contacts between individuals in at each TSW based on a specified SpTh. As a last step,it restricts contacts records to only those of a minimum duration. The result is a table that details all non-zero contacts between all individuals of a set duration.  
+
+The first code chunk below loads the function described above. The next chunk executes it. 
+
+```{r Cow Direct Contact Duration Function, echo=FALSE}
+
+durationfunc<-function(MCDspec=MCD, dist.all.matrix, SpThspec=0.333,TSWspec=10)  {
+    dist.all.matrix<-dist.all
+    #isequence: sets up coluns of adj. matrix
+    iseq<-NULL
+    for (i in 1:(NoInd)){
+      iseq1<-rep(i,NoInd-i)
+      iseq<-c(iseq, iseq1)} 
+  
+    #jsequence: sets up rows of adj.matrix
+    jseq<-NULL
+    for (j in 2:(NoInd)){
+      jseq1<-seq(j,NoInd,1)
+      jseq<-c(jseq, jseq1)}
+  
+  distthreshold<-ifelse(dist.all.matrix<=SpThspec & dist.all.matrix>0,1,0) 
+  durationmat<-NULL
+    for (i in 1:length(distthreshold[1,])){
+      durvect<-distthreshold[,i]
+      durvect<-ifelse(sum(durvect)==0 | is.na(durvect),0, durvect) #this evaluates whether either there are no contacts or Na's. If so, it sets the value to zero
+      if(length(durvect)==1) {next #if the length is greater than 1, it moves to next link in the loop. 
+      } else { 
+      
+        durvect<-rle(durvect) #This breaks the sequence into 1's and 0's, counting the number of each in sequence
+        finish<-cumsum(unlist(durvect[1]))
+        start<-finish-unlist(durvect[1])+1
+        durmat<-data.frame(unlist(durvect[1]), unlist(durvect[2]), start, finish) 
+      
+        durmat$Ind1<-rep(iseq[i], length(durmat[,1])) ##ID's Ind#1
+        durmat$Ind2<-rep(jseq[i], length(durmat[,1])) ##ID's Ind#2
+
+        durationmat<-rbind(durationmat, durmat)
+      } 
+    }
+    names(durationmat)<-c("Duration", "Contact", "Start", "End", "Ind1", "Ind2")
+    duration<-durationmat
+    duration$Duration   
+    duration$Month=Month
+    duration$Day=Day
+    duration$Hour=floor((duration$Start/((60/TSWspec)*60*24))*24) #duration$Hour=floor(duration$Start/((60/temp)*60*24)*24) this formula gives the start time divided by the number of tempseq[o] intervals in a day and multiplies it by 24 to get the hour #the interval is greater than 
+    duration<-duration[duration[,2]==1,]  #restricts it to only cows contacted; classified as 1
+    duration<-duration[duration[,1]>=MCDspec,] #restricts it to only cows contacted for durseq duration.
+    save(duration, file = paste("S1_DurationTime_",TSWspec,"sec_TSW_",SpThspec,"m_SpTh_", MCDspec,"_MCD_", Month, Day,   Year,".RData", sep=""))
+    
+  
+return(duration)} 
+
+```
+
+This runs the above function, with the result being a series of duration tables, depending on the number of days of data used. 
+
+```{r Cow Direct Contact Durations, echo=FALSE}
+
+for (i in 1:length(dateseq)){
+  load(paste("All_Distances_",TSW,"sec_TSW_",Month, dateseq[i],Year,".RData", sep=""))
+    durationfunc(dist.all, SpThspec=SpTh, MCDspec=MCD, TSWspec=TSW)
+        }
+
+```
+
+
+This last section creates adjacency matrices based on the duration tables created above. Each table is loaded, and then adjaceny matrices are created as an array. The "depth" of the array depends upon whether a timestep array is desired versus an aggregated one, such as an hour or day. This code is set up create an array of contacts per hour. If a timestep based array is desired for entropy analysis, please see electronic supplementary materials S3, as it is more effecient to create temporal adjacency matrices prior to analysis than to create a potentially very large (8640 layers per day at 10 sec TSW) array. 
+
+```{r Creating Contact Table from Direct Duration Table, echo=FALSE}
+
+#Direct
+for(j in 1:length(dateseq)){
+load(paste("S1_DurationTime_", TSW,"sec_TSW_", SpTh,"m_SpTh_", MCD,"_MCD_", Month, Day, Year,".RData", sep="")) 
+Durag<-aggregate(Duration~Ind1+Ind2+Hour+Day, data=duration, FUN="sum")
+days<-unique(Durag$Day)
+hours<-0:23
+params<-expand.grid(hours,days)
+names(params)<-c("hour", "day")
+
+
+#To translate duration table contact table 
+adj.matlist<-array(dim=c(70,70,1))  ##This creates a seed matrix on which to add things
+for ( m in 1:length(params[,1])){
+  sub<-Durag[Durag$Day==params[m,2] & Durag$Hour==params[m,1],]
+   adj.matrix<-matrix(0,ncol=NoCows, nrow=NoCows) #sets up blank matrix    
+   for ( j in 1:length(sub[,1])) {
+     adj.matrix[sub[j,match("Ind2",names(sub))],sub[j,match("Ind1",names(sub))]]=sub[j,match("Duration", names(sub))] #lower triangle
+     adj.matrix[sub[j,match("Ind1",names(sub))],sub[j,match("Ind2",names(sub))]]=sub[j,match("Duration", names(sub))]} #upper triangle
+    adj.matlist<-abind(adj.matlist, adj.matrix)
+    } #abind in this command refers to binding along the third dimension, ie., not rows or columns but stacking them
+  adj.matlist<-adj.matlist[,,-1]
+  cta<-adj.matlist
+  save(cta, file=paste("S1_ContactDurationArray_ByHour_", TSW,"sec_TSW_", SpTh,"m_SpTh_", MCD,"_MCD_", Month, Day, Year,".RData", sep=""))}
+  
+#################
+  
+```
